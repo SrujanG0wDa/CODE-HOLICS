@@ -85,3 +85,4 @@ ACK 3
 - `DELETE /keys/<key>` - Delete key
 - `GET /dump` - JSON map of all live keys
 - `POST /compact` - Trigger compaction
+
