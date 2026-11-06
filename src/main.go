@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -40,6 +42,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdCompact(dbPath, stderr)
 	case "serve":
 		return cmdServe(dbPath, stdin, stdout, stderr)
+	case "http":
+		return cmdHTTP(dbPath, args[3:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", cmd)
 		return 2
@@ -420,4 +424,112 @@ func parseBatchLine(line string) (BatchOp, error) {
 		return BatchOp{Key: []byte(key), Value: nil}, nil
 	}
 	return BatchOp{}, fmt.Errorf("invalid batch line: %q", line)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP / REST server
+// ---------------------------------------------------------------------------
+
+func cmdHTTP(dbPath string, args []string, stdout, stderr io.Writer) int {
+	addr := ":8080"
+	if len(args) > 0 {
+		addr = args[0]
+	}
+
+	e, err := Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error opening db: %v\n", err)
+		return 1
+	}
+	defer e.Close()
+
+	mux := http.NewServeMux()
+
+	// Route: /keys/<key> for GET, PUT, DELETE
+	mux.HandleFunc("/keys/", func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/keys/")
+		if key == "" {
+			http.Error(w, "missing key", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			val, err := e.Get([]byte(key))
+			if err != nil {
+				if err == ErrNotFound {
+					http.Error(w, "not found", http.StatusNotFound)
+				} else {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				}
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(val)
+
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "cannot read request body", http.StatusBadRequest)
+				return
+			}
+			if err := e.Put([]byte(key), body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "OK")
+
+		case http.MethodDelete:
+			if err := e.Delete([]byte(key)); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "OK")
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Route: /dump for JSON snapshot of all live keys
+	mux.HandleFunc("/dump", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		data := make(map[string]string)
+		err := e.ForEach(func(k, v []byte) error {
+			data[string(k)] = string(v)
+			return nil
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(data)
+	})
+
+	// Route: /compact to trigger background compaction
+	mux.HandleFunc("/compact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := e.Compact(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "COMPACTED")
+	})
+
+	fmt.Fprintf(stdout, "kvdb HTTP REST server listening on %s (DB: %s)\n", addr, dbPath)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		fmt.Fprintf(stderr, "server error: %v\n", err)
+		return 1
+	}
+	return 0
 }
