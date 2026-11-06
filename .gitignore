@@ -1,0 +1,12 @@
+# Binaries
+*.exe
+kvdb
+
+# Database files
+*.db
+*.data
+*.compact
+
+# Test artifacts
+sentinel.*
+test.*
